@@ -1,0 +1,6 @@
+pandas
+numpy
+pyodbc
+fastapi
+uvicorn
+openai
