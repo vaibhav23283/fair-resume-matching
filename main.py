@@ -1,83 +1,134 @@
-# -----------------------------
-# IMPORTS
-# -----------------------------
 import pandas as pd
 import numpy as np
 import pyodbc
-from openai import OpenAI
+import requests
+import os
+import time
 from cleaner import clean_resume
 
-# -----------------------------
-# MICROSOFT AI (GitHub Models)
-# -----------------------------
-GITHUB_TOKEN = "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"
+# --------------------------------------------------
+# CONFIGURATION
+# --------------------------------------------------
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 
-client = OpenAI(
-    api_key=GITHUB_TOKEN,
-    base_url="https://models.inference.ai.azure.com"
-)
+if not GITHUB_TOKEN:
+    raise RuntimeError("GITHUB_TOKEN not found. Set it as an environment variable.")
 
-def get_embedding(text: str):
-    resp = client.embeddings.create(
-        model="text-embedding-3-small",
-        input=text
-    )
-    return resp.data[0].embedding
+EMBEDDING_URL = "https://models.inference.ai.azure.com/embeddings"
+EMBEDDING_MODEL = "text-embedding-3-small"
 
-# -----------------------------
-# LOAD DATA
-# -----------------------------
+# --------------------------------------------------
+# EMBEDDING FUNCTION (DIRECT REST CALL)
+# --------------------------------------------------
+def get_embedding(text):
+    if text is None or str(text).strip() == "":
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": EMBEDDING_MODEL,
+        "input": str(text)
+    }
+
+    response = requests.post(EMBEDDING_URL, headers=headers, json=payload)
+
+    if response.status_code == 429:
+        time.sleep(20)  # wait before retry
+        response = requests.post(EMBEDDING_URL, headers=headers, json=payload)
+
+    if response.status_code != 200:
+        print("❌ Embedding error:", response.text)
+        return None
+
+    time.sleep(4)  # prevent rate limit
+    return response.json()["data"][0]["embedding"]
+
+# --------------------------------------------------
+# LOAD CSV DATA
+# --------------------------------------------------
 resumes = pd.read_csv("resumes.csv")
 jobs = pd.read_csv("jobs.csv")
 
-# -----------------------------
-# BIAS REMOVAL (ANONYMIZATION)
-# -----------------------------
-resumes["text"] = resumes["text"].apply(clean_resume)
+if "text" not in resumes.columns:
+    raise ValueError("resumes.csv must contain a 'text' column")
 
-# -----------------------------
+if "description" not in jobs.columns:
+    raise ValueError("jobs.csv must contain a 'description' column")
+
+resumes = resumes.dropna(subset=["text"])
+jobs = jobs.dropna(subset=["description"])
+
+# --------------------------------------------------
+# BIAS REMOVAL (RESPONSIBLE AI)
+# --------------------------------------------------
+resumes["text"] = resumes["text"].astype(str).apply(clean_resume)
+jobs["description"] = jobs["description"].astype(str)
+
+# --------------------------------------------------
 # GENERATE EMBEDDINGS
-# -----------------------------
-resume_vectors = np.array([get_embedding(t) for t in resumes["text"]])
-job_vectors = np.array([get_embedding(t) for t in jobs["description"]])
+# --------------------------------------------------
+resume_vectors = []
+resume_ids = []
 
-# -----------------------------
+for i, row in resumes.iterrows():
+    emb = get_embedding(row["text"])
+    if emb is not None:
+        resume_vectors.append(emb)
+        resume_ids.append(row["id"])
+
+job_vectors = []
+job_ids = []
+
+for i, row in jobs.iterrows():
+    emb = get_embedding(row["description"])
+    if emb is not None:
+        job_vectors.append(emb)
+        job_ids.append(row["id"])
+
+resume_vectors = np.array(resume_vectors)
+job_vectors = np.array(job_vectors)
+
+# --------------------------------------------------
 # COSINE SIMILARITY
-# -----------------------------
+# --------------------------------------------------
 def cosine_similarity(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
-scores = []
-for r in resume_vectors:
-    row = []
-    for j in job_vectors:
-        row.append(cosine_similarity(r, j))
-    scores.append(row)
+scores = np.zeros((len(resume_vectors), len(job_vectors)))
 
-# -----------------------------
-# PRINT RANKING (CONSOLE)
-# -----------------------------
+for i in range(len(resume_vectors)):
+    for j in range(len(job_vectors)):
+        scores[i][j] = cosine_similarity(resume_vectors[i], job_vectors[j])
+
+# --------------------------------------------------
+# PRINT RESULTS
+# --------------------------------------------------
 print("\n=== FAIR RESUME–JOB MATCHING RESULTS ===\n")
 
-for j, job in jobs.iterrows():
-    print(f"Job {job['id']}: {job['description']}")
+for j, job_id in enumerate(job_ids):
+    job_desc = jobs[jobs["id"] == job_id]["description"].values[0]
+    print(f"Job {job_id}: {job_desc}")
 
-    job_scores = []
-    for i, resume in resumes.iterrows():
-        score = scores[i][j]
-        job_scores.append((resume["text"], score))
+    ranked = []
+    for i, resume_id in enumerate(resume_ids):
+        ranked.append((resume_id, scores[i][j]))
 
-    job_scores.sort(key=lambda x: x[1], reverse=True)
+    ranked.sort(key=lambda x: x[1], reverse=True)
 
-    for rank, (text, score) in enumerate(job_scores[:2], start=1):
-        print(f"   Rank {rank}: {text}")
+    for rank, (rid, score) in enumerate(ranked[:2], start=1):
+        resume_text = resumes[resumes["id"] == rid]["text"].values[0]
+        print(f"   Rank {rank}: {resume_text}")
         print(f"      Match Score: {score:.3f}")
 
     print("-" * 50)
 
-# -----------------------------
-# SAVE RESULTS TO SQL SERVER
-# -----------------------------
+# --------------------------------------------------
+# SAVE TO SQL SERVER
+# --------------------------------------------------
 conn = pyodbc.connect(
     "Driver={SQL Server};"
     "Server=localhost\\SQLEXPRESS;"
@@ -86,17 +137,16 @@ conn = pyodbc.connect(
 )
 
 cursor = conn.cursor()
-
-# Clear old results
 cursor.execute("DELETE FROM Matches")
 conn.commit()
 
-# Insert new scores
-for j, job in jobs.iterrows():
-    for i, resume in resumes.iterrows():
+for i, resume_id in enumerate(resume_ids):
+    for j, job_id in enumerate(job_ids):
         cursor.execute(
             "INSERT INTO Matches (resume_id, job_id, score) VALUES (?, ?, ?)",
-            int(i + 1), int(j + 1), float(scores[i][j])
+            int(resume_id),
+            int(job_id),
+            float(scores[i][j])
         )
 
 conn.commit()
@@ -104,3 +154,4 @@ cursor.close()
 conn.close()
 
 print("\n✅ Results saved successfully to SQL Server!")
+
